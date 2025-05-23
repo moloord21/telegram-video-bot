@@ -4,7 +4,8 @@ import subprocess
 import tempfile
 import time
 import signal
-from telegram import Update
+import threading
+from telegram import Update, Chat
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # إعداد التسجيل
@@ -22,31 +23,26 @@ RESOLUTIONS = {
 
 # تحديد الحد الأقصى لوقت التشغيل (285 دقيقة = 4.75 ساعات)
 MAX_RUNTIME = 285 * 60  
+start_time = time.time()
 
-def setup_shutdown_handler():
-    start_time = time.time()
-    
-    def timeout_handler(signum, frame):
+def check_timeout():
+    if time.time() - start_time > MAX_RUNTIME:
         logger.info("تم الوصول إلى الحد الأقصى لوقت التشغيل، جاري إيقاف البوت...")
         raise SystemExit(0)
-    
-    def check_timeout():
-        if time.time() - start_time > MAX_RUNTIME:
-            logger.info("تم الوصول إلى الحد الأقصى لوقت التشغيل، جاري إيقاف البوت...")
-            raise SystemExit(0)
-    
-    signal.signal(signal.SIGALRM, timeout_handler)
-    return check_timeout
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """إرسال رسالة عند إصدار الأمر /start."""
     await update.message.reply_text(
-        'مرحبا! أرسل لي فيديو، وسأقوم بتحويله إلى دقات مختلفة: 144p، 240p، 360p، 480p، و720p.'
+        'مرحبا! أرسل لي فيديو، وسأقوم بتحويله إلى دقات مختلفة: 144p، 240p، 360p، 480p، و720p.\n'
+        'يمكنك أيضًا إضافتي إلى مجموعة للتعامل مع الفيديوهات الكبيرة!'
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """إرسال رسالة عند إصدار الأمر /help."""
-    await update.message.reply_text('فقط أرسل لي أي ملف فيديو، وسأقوم بمعالجته لك!')
+    await update.message.reply_text(
+        'فقط أرسل لي أي ملف فيديو، وسأقوم بمعالجته لك!\n'
+        'للفيديوهات الكبيرة: أضفني إلى مجموعة وأرسل الفيديو هناك.'
+    )
 
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """معالجة الفيديو بدقات مختلفة وإرساله مرة أخرى."""
@@ -55,13 +51,16 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("الرجاء إرسال ملف فيديو.")
         return
 
-    await update.message.reply_text("لقد استلمت فيديو الخاص بك! جاري معالجته بدقات مختلفة...")
-
+    # تحديد ما إذا كانت الرسالة من مجموعة أم محادثة خاصة
+    is_group = update.message.chat.type in [Chat.GROUP, Chat.SUPERGROUP]
+    
     # الحصول على الملف
     if update.message.video:
         file = await update.message.video.get_file()
     else:
         file = await update.message.document.get_file()
+
+    await update.message.reply_text("لقد استلمت فيديو الخاص بك! جاري معالجته بدقات مختلفة...")
 
     # تنزيل الفيديو
     with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_input:
@@ -85,6 +84,10 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 output_path
             ]
             
+            # إضافة تحديد حجم الملف إذا كانت محادثة خاصة (غير مجموعة)
+            if not is_group:
+                cmd.extend(['-fs', '49M'])
+            
             process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -99,10 +102,36 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         
         # إرسال كل فيديو تمت معالجته
         for res_name, output_path in output_files:
-            await update.message.reply_document(
-                document=open(output_path, 'rb'),
-                caption=f"فيديو الخاص بك بدقة {res_name}"
-            )
+            try:
+                file_size = os.path.getsize(output_path)
+                # للتأكد من حجم الملف قبل محاولة إرساله
+                size_mb = file_size / (1024 * 1024)
+                
+                # إذا كان في محادثة خاصة وحجم الملف كبير
+                if not is_group and size_mb > 49:
+                    await update.message.reply_text(
+                        f"الفيديو بدقة {res_name} ({size_mb:.1f} ميجابايت) كبير جدًا للإرسال في المحادثة الخاصة.\n"
+                        "يرجى إضافة البوت إلى مجموعة وإرسال الفيديو هناك للتعامل مع الملفات الكبيرة."
+                    )
+                    continue
+                
+                await update.message.reply_document(
+                    document=open(output_path, 'rb'),
+                    caption=f"فيديو الخاص بك بدقة {res_name} ({size_mb:.1f} ميجابايت)"
+                )
+                await update.message.reply_text(f"تم إرسال الفيديو بدقة {res_name} بنجاح!")
+                
+            except Exception as e:
+                logger.error(f"خطأ أثناء إرسال الفيديو بدقة {res_name}: {e}")
+                if "too big" in str(e).lower():
+                    await update.message.reply_text(
+                        f"فشل في إرسال الفيديو بدقة {res_name} لأنه كبير جدًا. "
+                        f"حاول استخدام البوت في مجموعة بدلاً من محادثة خاصة للتعامل مع الملفات الكبيرة."
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"فشل في إرسال الفيديو بدقة {res_name} بسبب خطأ. الرجاء المحاولة لاحقًا."
+                    )
             
     except Exception as e:
         logger.error(f"خطأ: {e}")
@@ -115,6 +144,12 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if os.path.exists(output_path):
                 os.unlink(output_path)
 
+def check_runtime_periodically():
+    """دالة تتحقق من وقت التشغيل بشكل دوري"""
+    while True:
+        check_timeout()
+        time.sleep(60)  # تحقق كل 60 ثانية
+
 def main() -> None:
     """بدء تشغيل البوت."""
     # الحصول على التوكن من متغير البيئة
@@ -122,9 +157,6 @@ def main() -> None:
     if not token:
         logger.error("لم يتم توفير توكن")
         return
-    
-    # إعداد التحقق من المهلة
-    check_timeout = setup_shutdown_handler()
     
     # إنشاء التطبيق
     application = ApplicationBuilder().token(token).build()
@@ -134,12 +166,8 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, process_video))
     
-    # تعريف دالة مرجعية للتحقق بشكل دوري من وقت التشغيل
-    async def check_runtime_callback(context: ContextTypes.DEFAULT_TYPE):
-        check_timeout()
-    
-    # إضافة مهمة للتحقق من وقت التشغيل كل دقيقة
-    application.job_queue.run_repeating(check_runtime_callback, interval=60)
+    # بدء thread للتحقق من وقت التشغيل
+    threading.Thread(target=check_runtime_periodically, daemon=True).start()
 
     # تشغيل البوت
     application.run_polling()
